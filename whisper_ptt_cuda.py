@@ -11,10 +11,13 @@ Optional: Ollama for LLM transform.
 
 import io
 import os
+import shutil
+import subprocess
 import wave
 import time
 import threading
 import collections
+from typing import overload
 import keyboard
 import pyaudio
 import pyperclip
@@ -37,7 +40,17 @@ except ImportError:
         print()
 
 
-def _env(key, default, *, type_=str):
+@overload
+def _env(key: str, default: str, *, type_: type[str] = str) -> str: ...
+@overload
+def _env(key: str, default: str, *, type_: type[bool]) -> bool: ...
+@overload
+def _env(key: str, default: str, *, type_: type[int]) -> int: ...
+@overload
+def _env(key: str, default: str, *, type_: type[float]) -> float: ...
+
+
+def _env(key: str, default: str, *, type_: type = str):
     """Read env var with type coercion. WHISPER_PTT_ prefix is optional."""
     full_key = key if key.startswith("WHISPER_PTT_") else f"WHISPER_PTT_{key}"
     raw = os.environ.get(full_key, os.environ.get(key, default))
@@ -102,11 +115,31 @@ KEYS_AFTER_PASTE = _env("KEYS_AFTER_PASTE", "enter").strip().lower()
 if KEYS_AFTER_PASTE in ("", "none"):
     KEYS_AFTER_PASTE = None
 
+# Paste shortcut (sent via `keyboard.send` after clipboard is set).
+# Terminals (Konsole, xterm, gnome-terminal, etc.) need Ctrl+Shift+V because
+# plain Ctrl+V in readline is `quoted-insert` and produces garbage characters.
+DEFAULT_PASTE_SHORTCUT = _env("PASTE_SHORTCUT", "ctrl+v").strip().lower()
+TERMINAL_PASTE_SHORTCUT = _env("TERMINAL_PASTE_SHORTCUT", "ctrl+shift+v").strip().lower()
+AUTO_DETECT_TERMINAL = _env("AUTO_DETECT_TERMINAL", "true", type_=bool)
+
+# WM_CLASS values reported by common X11 terminal emulators (lowercase).
+TERMINAL_WM_CLASSES = {
+    "konsole", "yakuake", "xterm", "uxterm", "urxvt", "rxvt",
+    "gnome-terminal", "gnome-terminal-server", "terminator",
+    "tilix", "xfce4-terminal", "alacritty", "kitty", "wezterm",
+    "st-256color", "st", "qterminal", "lxterminal", "kgx",
+}
+
 # Audio
-SAMPLE_RATE = _env("SAMPLE_RATE", "16000", type_=int)
+MIC_SAMPLE_RATE = 48000  # Hardware sample rate (USB mic supports 44100/48000)
+SAMPLE_RATE = _env("SAMPLE_RATE", "16000", type_=int)  # Whisper target rate
 CHANNELS = 1
 CHUNK_SIZE = _env("CHUNK_SIZE", "1024", type_=int)
 AUDIO_FORMAT = pyaudio.paInt16
+INPUT_DEVICE_INDEX = _env("INPUT_DEVICE_INDEX", "").strip()
+INPUT_DEVICE_NAME = _env("INPUT_DEVICE_NAME", "").strip().lower()
+AUTO_SELECT_INPUT_DEVICE = _env("AUTO_SELECT_INPUT_DEVICE", "true", type_=bool)
+LIST_AUDIO_DEVICES = _env("LIST_AUDIO_DEVICES", "false", type_=bool)
 
 # Prebuffer and padding
 PREBUFFER_SEC = _env("PREBUFFER_SEC", "0.5", type_=float)
@@ -122,6 +155,24 @@ SILENCE_AMPLITUDE_THRESHOLD = _env("SILENCE_AMPLITUDE", "750", type_=int)
 
 def _setup_cuda_dll_path():
     """Add nvidia.cublas/cudnn/cuda_runtime bin dirs to PATH for DLL loading."""
+    cuda_paths = [
+        "/usr/local/cuda/lib64",
+        "/usr/local/cuda-12/lib64",
+        "/usr/lib/x86_64-linux-gnu",
+    ]
+    for path in cuda_paths:
+        if os.path.isdir(path):
+            try:
+                os.add_dll_directory(path)
+            except Exception:
+                pass
+
+    cuda_lib = os.environ.get("LD_LIBRARY_PATH", "")
+    for path in cuda_paths:
+        if path not in cuda_lib:
+            cuda_lib += os.pathsep + path
+    os.environ["LD_LIBRARY_PATH"] = cuda_lib
+
     for name in ("nvidia.cublas", "nvidia.cudnn", "nvidia.cuda_runtime"):
         try:
             mod = __import__(name, fromlist=[""])
@@ -142,11 +193,11 @@ _setup_cuda_dll_path()
 
 _recording = False
 _audio_frames = []
-_prebuffer_deque = None
+_prebuffer_deque: collections.deque[bytes] | None = None
 _prebuffer_lock = threading.Lock()
 _prebuffer_running = True
-_pyaudio_instance = None
-_whisper_model = None
+_pyaudio_instance: pyaudio.PyAudio | None = None
+_whisper_model: WhisperModel | None = None
 
 
 def _prebuffer_size():
@@ -157,12 +208,81 @@ def _prebuffer_size():
 # Audio: prebuffer and WAV
 # -----------------------------------------------------------------------------
 
+def _input_devices():
+    """Return PyAudio input devices visible in the current runtime."""
+    devices = []
+    if _pyaudio_instance is None:
+        return devices
+    for index in range(_pyaudio_instance.get_device_count()):
+        try:
+            info = _pyaudio_instance.get_device_info_by_index(index)
+        except Exception:
+            continue
+        if int(info.get("maxInputChannels", 0)) <= 0:
+            continue
+        devices.append(info)
+    return devices
+
+
+def _print_input_devices():
+    devices = _input_devices()
+    if not devices:
+        print("❌ No input audio devices found.")
+        return
+    print("🎚️ Input audio devices visible to this process:")
+    for info in devices:
+        index = int(info["index"])
+        name = info["name"]
+        channels = int(info.get("maxInputChannels", 0))
+        rate = int(float(info.get("defaultSampleRate", 0)))
+        print(f"  [{index}] {name} (inputs={channels}, default_rate={rate})")
+
+
+def _auto_select_input_device_index():
+    if not AUTO_SELECT_INPUT_DEVICE:
+        return None
+    preferred_tokens = ("usb pnp", "usb", "microphone", "mic", "capture")
+    ignored_tokens = ("pulse", "default", "sysdefault")
+    for token in preferred_tokens:
+        for info in _input_devices():
+            name = str(info.get("name", "")).lower()
+            if token not in name:
+                continue
+            if any(ignored in name for ignored in ignored_tokens):
+                continue
+            return int(info["index"])
+    return None
+
+
+def _resolve_input_device_index():
+    if INPUT_DEVICE_INDEX:
+        try:
+            return int(INPUT_DEVICE_INDEX)
+        except ValueError:
+            raise SystemExit(f"Invalid config: INPUT_DEVICE_INDEX must be an integer (got {INPUT_DEVICE_INDEX!r}).")
+    if not INPUT_DEVICE_NAME:
+        return _auto_select_input_device_index()
+    for info in _input_devices():
+        if INPUT_DEVICE_NAME in str(info.get("name", "")).lower():
+            return int(info["index"])
+    _print_input_devices()
+    raise SystemExit(f"Input device matching {INPUT_DEVICE_NAME!r} was not found.")
+
+
 def _open_microphone_stream():
+    assert _pyaudio_instance is not None
+    input_device_index = _resolve_input_device_index()
+    if input_device_index is None:
+        print("🎙️ Input device: system default")
+    else:
+        info = _pyaudio_instance.get_device_info_by_index(input_device_index)
+        print(f"🎙️ Input device: [{input_device_index}] {info['name']}")
     return _pyaudio_instance.open(
         format=AUDIO_FORMAT,
         channels=CHANNELS,
-        rate=SAMPLE_RATE,
+        rate=MIC_SAMPLE_RATE,
         input=True,
+        input_device_index=input_device_index,
         frames_per_buffer=CHUNK_SIZE,
     )
 
@@ -170,6 +290,8 @@ def _open_microphone_stream():
 def prebuffer_worker():
     """Background thread: read mic into ring buffer; when recording, also append to _audio_frames."""
     global _recording, _audio_frames
+    assert _prebuffer_deque is not None
+    prebuffer_deque = _prebuffer_deque
     stream = _open_microphone_stream()
     while _prebuffer_running:
         try:
@@ -177,16 +299,34 @@ def prebuffer_worker():
         except Exception:
             break
         with _prebuffer_lock:
-            _prebuffer_deque.append(chunk)
+            prebuffer_deque.append(chunk)
             if _recording:
                 _audio_frames.append(chunk)
     stream.stop_stream()
     stream.close()
 
 
+def _resample_audio(audio_int16, src_rate, dst_rate):
+    """Simple linear resampling from src_rate to dst_rate."""
+    if src_rate == dst_rate:
+        return audio_int16
+    ratio = src_rate / dst_rate
+    n_dst = int(len(audio_int16) / ratio)
+    if n_dst == 0:
+        return audio_int16
+    indices = np.arange(n_dst) * ratio
+    indices_floor = indices.astype(np.int32)
+    indices_ceil = np.minimum(indices_floor + 1, len(audio_int16) - 1)
+    frac = indices - indices_floor
+    audio_float = audio_int16.astype(np.float32)
+    resampled = audio_float[indices_floor] * (1 - frac) + audio_float[indices_ceil] * frac
+    return resampled.astype(np.int16)
+
+
 def start_recording():
     """Start recording: copy prebuffer into _audio_frames; _recording flag lets worker append."""
     global _recording, _audio_frames
+    assert _prebuffer_deque is not None
     with _prebuffer_lock:
         _audio_frames[:] = list(_prebuffer_deque)
     _recording = True
@@ -195,16 +335,20 @@ def start_recording():
 
 def frames_to_wav(frames, prepend_silence_sec=0):
     """Bytes frames list → WAV in memory (BytesIO). Optionally prepend silence."""
+    assert _pyaudio_instance is not None
+    raw = b"".join(frames)
+    audio_int16 = np.frombuffer(raw, dtype=np.int16)
+    audio_resampled = _resample_audio(audio_int16, MIC_SAMPLE_RATE, SAMPLE_RATE)
     if prepend_silence_sec > 0:
         sample_width = _pyaudio_instance.get_sample_size(AUDIO_FORMAT)
         silence_len = int(prepend_silence_sec * SAMPLE_RATE) * sample_width
-        frames = [b"\x00" * silence_len] + list(frames)
+        audio_resampled = np.concatenate([np.zeros(silence_len // sample_width, dtype=np.int16), audio_resampled])
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wav:
         wav.setnchannels(CHANNELS)
         wav.setsampwidth(_pyaudio_instance.get_sample_size(AUDIO_FORMAT))
         wav.setframerate(SAMPLE_RATE)
-        wav.writeframes(b"".join(frames))
+        wav.writeframes(audio_resampled.tobytes())
     buf.seek(0)
     return buf
 
@@ -215,6 +359,7 @@ def frames_to_wav(frames, prepend_silence_sec=0):
 
 def transcribe(wav_buffer):
     """Transcribe WAV with Whisper. Returns (text, language_code)."""
+    assert _whisper_model is not None
     print("🔄 Transcribing...")
     t0 = time.time()
     segments, info = _whisper_model.transcribe(
@@ -260,6 +405,45 @@ def transform_with_llm(raw_text, detected_lang):
 # Output: clipboard and/or paste to active window
 # -----------------------------------------------------------------------------
 
+def _active_window_class():
+    """Return lowercase WM_CLASS of the active X11 window, or None on failure."""
+    if not shutil.which("xprop"):
+        return None
+    try:
+        root = subprocess.run(
+            ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
+            capture_output=True, text=True, timeout=0.3,
+        ).stdout
+    except Exception:
+        return None
+    parts = root.strip().split()
+    if not parts:
+        return None
+    wid = parts[-1]
+    if not wid.startswith("0x"):
+        return None
+    try:
+        wm = subprocess.run(
+            ["xprop", "-id", wid, "WM_CLASS"],
+            capture_output=True, text=True, timeout=0.3,
+        ).stdout
+    except Exception:
+        return None
+    return wm.lower()
+
+
+def _detect_paste_shortcut():
+    """Pick paste shortcut based on active window class. Fallback to default."""
+    if not AUTO_DETECT_TERMINAL:
+        return DEFAULT_PASTE_SHORTCUT
+    wm = _active_window_class()
+    if wm is None:
+        return DEFAULT_PASTE_SHORTCUT
+    if any(cls in wm for cls in TERMINAL_WM_CLASSES):
+        return TERMINAL_PASTE_SHORTCUT
+    return DEFAULT_PASTE_SHORTCUT
+
+
 def paste_to_front(text):
     """Copy to clipboard and/or paste to active window (Ctrl+V). If KEYS_AFTER_PASTE set, send that key(s) after paste."""
     if not text.strip():
@@ -273,13 +457,14 @@ def paste_to_front(text):
     if COPY_TO_CLIPBOARD:
         print("📋 Copied to clipboard!")
     if PASTE_TO_ACTIVE_WINDOW:
-        keyboard.send("ctrl+v")
+        shortcut = _detect_paste_shortcut()
+        keyboard.send(shortcut)
         time.sleep(0.1)
         if KEYS_AFTER_PASTE:
             time.sleep(0.05)
             keyboard.send(KEYS_AFTER_PASTE)
         suffix = f' + "{KEYS_AFTER_PASTE.upper()}"' if KEYS_AFTER_PASTE else ""
-        print(f"✅ Pasted to active window{suffix}!")
+        print(f'✅ Pasted to active window via "{shortcut.upper()}"{suffix}!')
         if CLIPBOARD_AFTER_PASTE_POLICY == "restore":
             pyperclip.copy(old)
         elif CLIPBOARD_AFTER_PASTE_POLICY == "clear":
@@ -291,9 +476,19 @@ def paste_to_front(text):
 # -----------------------------------------------------------------------------
 
 def _process_recorded_frames(frames):
-    """Pipeline: frames → WAV → Whisper → optional LLM → paste."""
-    wav = frames_to_wav(frames, prepend_silence_sec=PADDING_SEC)
-    raw_text, lang = transcribe(wav)
+    """Pipeline: frames → resample → WAV → Whisper → optional LLM → paste."""
+    assert _pyaudio_instance is not None
+    raw = b"".join(frames)
+    audio_int16 = np.frombuffer(raw, dtype=np.int16)
+    audio_int16 = _resample_audio(audio_int16, MIC_SAMPLE_RATE, SAMPLE_RATE)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(CHANNELS)
+        wav.setsampwidth(_pyaudio_instance.get_sample_size(AUDIO_FORMAT))
+        wav.setframerate(SAMPLE_RATE)
+        wav.writeframes(audio_int16.tobytes())
+    buf.seek(0)
+    raw_text, lang = transcribe(buf)
     if USE_LLM_TRANSFORM and raw_text.strip():
         final_text = transform_with_llm(raw_text, lang)
     else:
@@ -310,7 +505,7 @@ def stop_recording_and_process():
     time.sleep(0.15)
 
     frames = list(_audio_frames)
-    duration_sec = len(frames) * CHUNK_SIZE / SAMPLE_RATE
+    duration_sec = len(frames) * CHUNK_SIZE / MIC_SAMPLE_RATE
     print(f"⏹️ Recorded {duration_sec:.1f}s (with {PREBUFFER_SEC}s prebuffer)")
 
     # Only process recordings longer than 0.7 seconds in total.
@@ -321,8 +516,9 @@ def stop_recording_and_process():
     # Simple silence / noise gate: skip very low-energy audio.
     raw = b"".join(frames)
     audio_int16 = np.frombuffer(raw, dtype=np.int16)
+    audio_int16 = _resample_audio(audio_int16, MIC_SAMPLE_RATE, SAMPLE_RATE)
     if audio_int16.size == 0 or np.max(np.abs(audio_int16)) < SILENCE_AMPLITUDE_THRESHOLD:
-        print("❌ Audio too quiet / silence, skipping")
+        print(f"❌ Audio too quiet / silence, skipping (max={np.max(np.abs(audio_int16))}, threshold={SILENCE_AMPLITUDE_THRESHOLD})")
         return
 
     threading.Thread(target=_process_recorded_frames, args=(frames,), daemon=True).start()
@@ -342,6 +538,16 @@ def _on_hotkey_release(_event=None):
     stop_recording_and_process()
 
 
+def _format_input_device_config():
+    if INPUT_DEVICE_INDEX:
+        return f"index {INPUT_DEVICE_INDEX}"
+    if INPUT_DEVICE_NAME:
+        return f'name contains "{INPUT_DEVICE_NAME}"'
+    if AUTO_SELECT_INPUT_DEVICE:
+        return "auto-select"
+    return "system default"
+
+
 def _format_banner():
     w = 70
     def line(s, width=None):
@@ -356,8 +562,13 @@ def _format_banner():
         line(f"     LLM transform: {'ON' if USE_LLM_TRANSFORM else 'OFF'}") + "\n",
         line(f"     Copy to clipboard: {'ON' if COPY_TO_CLIPBOARD else 'OFF'}") + "\n",
         line(f"     Paste to active window: {'ON' if PASTE_TO_ACTIVE_WINDOW else 'OFF'}") + "\n",
+        line(f"     Input device: {_format_input_device_config()}") + "\n",
     ]
     if PASTE_TO_ACTIVE_WINDOW:
+        if AUTO_DETECT_TERMINAL:
+            parts.append(line(f'     Paste shortcut: "{DEFAULT_PASTE_SHORTCUT.upper()}" / "{TERMINAL_PASTE_SHORTCUT.upper()}" in terminals (auto-detect)') + "\n")
+        else:
+            parts.append(line(f'     Paste shortcut: "{DEFAULT_PASTE_SHORTCUT.upper()}"') + "\n")
         parts.append((line(f'     Keys after paste: "{KEYS_AFTER_PASTE.upper()}"') if KEYS_AFTER_PASTE else line("     Keys after paste: —")) + "\n")
     parts.extend([line("") + "\n", line('     "CTRL+C" to exit') + "\n", "╚" + "═" * w + "╝"])
     return "".join(parts)
@@ -365,6 +576,11 @@ def _format_banner():
 
 def main():
     global _pyaudio_instance, _whisper_model, _prebuffer_deque
+
+    _pyaudio_instance = pyaudio.PyAudio()
+    if LIST_AUDIO_DEVICES:
+        _print_input_devices()
+        return
 
     print("⏳ Loading Whisper model... (first run may download the model)")
     _whisper_model = WhisperModel(
@@ -374,7 +590,6 @@ def main():
     )
     print("✅ Whisper loaded!")
 
-    _pyaudio_instance = pyaudio.PyAudio()
     _prebuffer_deque = collections.deque(maxlen=_prebuffer_size())
 
     print(f"🎧 Prebuffer active (last {PREBUFFER_SEC}s)")
